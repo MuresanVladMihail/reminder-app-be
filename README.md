@@ -6,7 +6,6 @@ Serverless email reminder scheduling service built with AWS Lambda, DynamoDB, SE
 
 ```bash
 npm install
-cp .env.example .env   # set RECIPIENT_EMAIL and SENDER_EMAIL
 
 npm run local:infra    # start DynamoDB Local + LocalStack
 npm run local:dev      # start API on http://localhost:3000
