@@ -1,0 +1,253 @@
+openapi: 3.1.1
+info:
+  title: Reminders API
+  description: Serverless email reminder scheduling service
+  version: 1.0.0
+  contact:
+    name: muresanvladmihail@gmail.com
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+  - url: https://{apiId}.execute-api.{region}.amazonaws.com/{stage}
+    description: AWS API Gateway
+    variables:
+      apiId:
+        default: your-api-id
+      region:
+        default: eu-west-1
+      stage:
+        default: dev
+
+tags:
+  - name: Reminders
+    description: Manage scheduled email reminders
+
+paths:
+  /reminders:
+    post:
+      tags: [ Reminders ]
+      operationId: createReminder
+      summary: Schedule a new reminder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateReminderRequest'
+            examples:
+              basic:
+                summary: Simple reminder
+                value:
+                  title: "Team meeting in 1 hour"
+                  scheduledAt: "2026-06-01T10:00:00.000Z"
+      responses:
+        '201':
+          description: Reminder created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReminderResponse'
+        '400':
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    get:
+      tags: [ Reminders ]
+      operationId: listReminders
+      summary: Paginate list all scheduled reminders
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/ReminderStatus'
+          description: Filter by reminder status
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: nextToken
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Pagination token from previous response
+      responses:
+        '200':
+          description: List of reminders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListRemindersResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /reminders/{id}:
+    delete:
+      tags: [ Reminders ]
+      operationId: deleteReminder
+      summary: Delete a scheduled reminder
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Reminder unique identifier
+      responses:
+        '204':
+          description: Reminder deleted successfully
+        '404':
+          description: Reminder not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Reminder already sent, cannot delete
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    get:
+      tags: [ Reminders ]
+      operationId: getReminder
+      summary: Get a single reminder by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Reminder details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReminderResponse'
+        '404':
+          description: Reminder not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    ReminderStatus:
+      type: string
+      enum: [ PENDING, SENT, DELETED ]
+      description: Current state of the reminder
+
+    CreateReminderRequest:
+      type: object
+      required: [ title, scheduledAt ]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: Reminder message text
+          example: "Call dentist for appointment"
+        scheduledAt:
+          type: string
+          format: date-time
+          description: ISO 8601 UTC datetime when the reminder should be sent
+          example: "2026-06-01T10:00:00.000Z"
+
+    Reminder:
+      type: object
+      required: [ id, title, scheduledAt, status, createdAt ]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique identifier
+        title:
+          type: string
+          description: Reminder message text
+        scheduledAt:
+          type: string
+          format: date-time
+          description: When the reminder is scheduled to fire
+        status:
+          $ref: '#/components/schemas/ReminderStatus'
+        createdAt:
+          type: string
+          format: date-time
+          description: When the reminder was created
+        sentAt:
+          type: string
+          format: date-time
+          description: When the email was actually sent (only present for SENT status)
+
+    ReminderResponse:
+      type: object
+      required: [ data ]
+      properties:
+        data:
+          $ref: '#/components/schemas/Reminder'
+
+    ListRemindersResponse:
+      type: object
+      required: [ data ]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Reminder'
+        pagination:
+          type: object
+          properties:
+            nextToken:
+              type: string
+              description: Token for next page, absent if no more results
+            count:
+              type: integer
+              description: Number of items in current page
+
+    ErrorResponse:
+      type: object
+      required: [ error ]
+      properties:
+        error:
+          type: object
+          required: [ code, message ]
+          properties:
+            code:
+              type: string
+              example: VALIDATION_ERROR
+            message:
+              type: string
+              example: "scheduledAt must be a future date"
+            details:
+              type: object
+              additionalProperties: true

@@ -1,0 +1,277 @@
+service: reminders-app
+
+frameworkVersion: '3'
+
+plugins:
+  - serverless-plugin-typescript
+  - serverless-dynamodb
+  - serverless-offline
+
+custom:
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'eu-west-1'}
+
+  # Table name with stage suffix
+  tableName: reminders-${self:custom.stage}
+
+  # SQS queue names
+  remindersQueueName: reminders-queue-${self:custom.stage}
+  remindersDlqName: reminders-dlq-${self:custom.stage}
+
+  # EventBridge Scheduler group name
+  schedulerGroupName: reminders-${self:custom.stage}
+
+  # Environment-specific settings
+  isLocal: ${strToBool(${env:IS_LOCAL, 'false'})}
+
+  # serverless-dynamodb (local)
+  serverless-dynamodb:
+    stages:
+      - dev
+    start:
+      port: 8000
+      inMemory: true
+      migrate: true
+      noStart: ${env:DYNAMODB_NO_START, 'false'}  # set true if using docker-compose dynamo
+
+  # serverless-offline
+  serverless-offline:
+    httpPort: 3000
+    lambdaPort: 3002
+    noPrependStageInUrl: true
+    reloadHandler: true
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  stage: ${self:custom.stage}
+  region: ${self:custom.region}
+  memorySize: 256
+  timeout: 30
+  logRetentionInDays: 14
+
+  environment:
+    STAGE: ${self:custom.stage}
+    REGION: ${self:custom.region}
+    TABLE_NAME: ${self:custom.tableName}
+    QUEUE_URL: !Ref RemindersQueue
+    QUEUE_ARN: !GetAtt RemindersQueue.Arn
+    SCHEDULER_ROLE_ARN: !GetAtt SchedulerRole.Arn
+    SCHEDULER_GROUP_NAME: ${self:custom.schedulerGroupName}
+    RECIPIENT_EMAIL: ${env:RECIPIENT_EMAIL, 'muresanvladmihail@gmail.com'}
+    SENDER_EMAIL: ${env:SENDER_EMAIL, 'noreply@example.com'}
+    IS_LOCAL: ${env:IS_LOCAL, 'false'}
+    # LocalStack endpoint (only used when IS_LOCAL=true)
+    AWS_ENDPOINT_URL: ${env:AWS_ENDPOINT_URL, ''}
+
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+            - dynamodb:Query
+            - dynamodb:Scan
+          Resource:
+            - !GetAtt RemindersTable.Arn
+            - !Sub '${RemindersTable.Arn}/index/*'
+
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+            - sqs:GetQueueUrl
+          Resource:
+            - !GetAtt RemindersQueue.Arn
+            - !GetAtt RemindersDLQ.Arn
+
+        - Effect: Allow
+          Action:
+            - ses:SendEmail
+            - ses:SendRawEmail
+          Resource: '*'
+
+        - Effect: Allow
+          Action:
+            - scheduler:CreateSchedule
+            - scheduler:DeleteSchedule
+            - scheduler:GetSchedule
+          Resource:
+            - !Sub 'arn:aws:scheduler:${self:custom.region}:${AWS::AccountId}:schedule/${self:custom.schedulerGroupName}/*'
+
+        - Effect: Allow
+          Action:
+            - iam:PassRole
+          Resource: !GetAtt SchedulerRole.Arn
+
+functions:
+  # API handlers
+  createReminder:
+    handler: src/functions/createReminder/handler.main
+    events:
+      - http:
+          path: /reminders
+          method: POST
+          cors: true
+
+  deleteReminder:
+    handler: src/functions/deleteReminder/handler.main
+    events:
+      - http:
+          path: /reminders/{id}
+          method: DELETE
+          cors: true
+
+  listReminders:
+    handler: src/functions/listReminders/handler.main
+    events:
+      - http:
+          path: /reminders
+          method: GET
+          cors: true
+
+  getReminder:
+    handler: src/functions/getReminder/handler.main
+    events:
+      - http:
+          path: /reminders/{id}
+          method: GET
+          cors: true
+
+  # SQS consumer — sends the actual email
+  processReminder:
+    handler: src/functions/processReminder/handler.main
+    reservedConcurrency: 10   # protect SES rate limits
+    events:
+      - sqs:
+          arn: !GetAtt RemindersQueue.Arn
+          batchSize: 10
+          maximumBatchingWindow: 5
+          functionResponseType: ReportBatchItemFailures
+
+  # LOCAL ONLY — simulates EventBridge Scheduler by polling DynamoDB every minute.
+  # In production the schedule is disabled; EventBridge Scheduler handles firing instead.
+  localSchedulerPoller:
+    handler: src/functions/localSchedulerPoller/handler.main
+    events:
+      - schedule:
+          rate: rate(1 minute)
+          enabled: ${self:custom.isLocal}
+
+resources:
+  Resources:
+    # ─── DynamoDB Table ──────────────────────────────────────────────────────
+    RemindersTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Retain          # never accidentally delete prod data
+      Properties:
+        TableName: ${self:custom.tableName}
+        TableClass: STANDARD_INFREQUENT_ACCESS
+        BillingMode: PAY_PER_REQUEST
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        SSESpecification:
+          SSEEnabled: true
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+          - AttributeName: status
+            AttributeType: S
+          - AttributeName: scheduledAt
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          # Used by local poller + list endpoint filtered by status
+          - IndexName: StatusScheduledAtIndex
+            KeySchema:
+              - AttributeName: status
+                KeyType: HASH
+              - AttributeName: scheduledAt
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+
+    # ─── SQS Queue ───────────────────────────────────────────────────────────
+    RemindersDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.remindersDlqName}
+        MessageRetentionPeriod: 1209600  # 14 days
+
+    RemindersQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.remindersQueueName}
+        VisibilityTimeout: 60
+        MessageRetentionPeriod: 86400   # 1 day
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt RemindersDLQ.Arn
+          maxReceiveCount: 3
+
+    # ─── EventBridge Scheduler Group ─────────────────────────────────────────
+    # Schedules are created inside this group; allows scoped IAM and cleanup.
+    RemindersSchedulerGroup:
+      Type: AWS::Scheduler::ScheduleGroup
+      Properties:
+        Name: ${self:custom.schedulerGroupName}
+
+    # ─── EventBridge Scheduler IAM Role ──────────────────────────────────────
+    SchedulerRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: reminders-scheduler-role-${self:custom.stage}
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: scheduler.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: SendToSQS
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - sqs:SendMessage
+                  Resource: !GetAtt RemindersQueue.Arn
+
+    # ─── CloudWatch Alarm for DLQ depth ──────────────────────────────────────
+    DLQDepthAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: reminders-dlq-depth-${self:custom.stage}
+        AlarmDescription: Messages in DLQ — requires investigation
+        MetricName: ApproximateNumberOfMessagesVisible
+        Namespace: AWS/SQS
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        Dimensions:
+          - Name: QueueName
+            Value: ${self:custom.remindersDlqName}
+
+  Outputs:
+    RemindersTableName:
+      Value: !Ref RemindersTable
+    RemindersQueueUrl:
+      Value: !Ref RemindersQueue
+    RemindersQueueArn:
+      Value: !GetAtt RemindersQueue.Arn
+    SchedulerRoleArn:
+      Value: !GetAtt SchedulerRole.Arn
+    SchedulerGroupName:
+      Value: !Ref RemindersSchedulerGroup
